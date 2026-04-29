@@ -1,0 +1,475 @@
+      `timescale 1ns/1ps
+
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+
+
+
+interface dma_if(input logic clk);
+
+    logic rst_n;
+    logic start;
+    logic [7:0] length;
+    logic busy;
+    logic dma_done;
+
+    logic [31:0] araddr;
+    logic        arvalid;
+    logic        arready;
+
+    logic [31:0] rdata;
+    logic        rvalid;
+    logic        rready;
+
+    logic [31:0] awaddr;
+    logic        awvalid;
+    logic        awready;
+
+    logic [31:0] wdata;
+    logic        wvalid;
+    logic        wready;
+
+    logic        bvalid;
+    logic        bready;
+
+endinterface
+
+`ifndef DMA_SEQ_ITEM_SV
+`define DMA_SEQ_ITEM_SV
+
+class dma_seq_item extends uvm_sequence_item;
+
+    rand bit [7:0]  length;
+    rand bit [31:0] base_data;
+
+    constraint length_c {
+        length inside {[1:8]};
+    }
+
+    `uvm_object_utils_begin(dma_seq_item)
+        `uvm_field_int(length,   UVM_ALL_ON)
+        `uvm_field_int(base_data, UVM_ALL_ON)
+    `uvm_object_utils_end
+
+    function new(string name = "dma_seq_item");
+        super.new(name);
+    endfunction
+
+endclass
+
+`endif
+
+`ifndef DMA_SEQUENCE_SV
+`define DMA_SEQUENCE_SV
+
+class dma_sequence extends uvm_sequence #(dma_seq_item);
+
+    `uvm_object_utils(dma_sequence)
+
+    function new(string name = "dma_sequence");
+        super.new(name);
+    endfunction
+
+    task body();
+        dma_seq_item item;
+
+        item = dma_seq_item::type_id::create("item");
+        start_item(item);
+
+        if (!item.randomize() with {
+            length == 4;
+            base_data == 32'hCAFEBABE;
+        }) begin
+            `uvm_error("SEQ", "Randomization failed")
+        end
+
+        finish_item(item);
+    endtask
+
+endclass
+
+`endif
+
+`ifndef DMA_DRIVER_SV
+`define DMA_DRIVER_SV
+
+class dma_driver extends uvm_driver #(dma_seq_item);
+
+    `uvm_component_utils(dma_driver)
+
+    virtual dma_if vif;
+
+    function new(string name = "dma_driver", uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        if (!uvm_config_db#(virtual dma_if)::get(this, "", "vif", vif)) begin
+            `uvm_fatal("DRV", "Failed to get virtual interface")
+        end
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        dma_seq_item item;
+
+        reset_dut();
+
+        forever begin
+            seq_item_port.get_next_item(item);
+            drive_transfer(item);
+            seq_item_port.item_done();
+        end
+    endtask
+
+    task reset_dut();
+        vif.rst_n   <= 0;
+        vif.start   <= 0;
+        vif.length  <= 0;
+
+        vif.arready <= 0;
+        vif.rvalid  <= 0;
+        vif.rdata   <= 0;
+
+        vif.awready <= 0;
+        vif.wready  <= 0;
+        vif.bvalid  <= 0;
+
+        repeat (5) @(posedge vif.clk);
+        vif.rst_n <= 1;
+        repeat (2) @(posedge vif.clk);
+    endtask
+
+    task automatic random_delay();
+        repeat ($urandom_range(1, 5)) @(posedge vif.clk);
+    endtask
+
+    task drive_transfer(dma_seq_item item);
+
+        vif.length <= item.length;
+
+        @(posedge vif.clk);
+        vif.start <= 1;
+        @(posedge vif.clk);
+        vif.start <= 0;
+
+        for (int i = 0; i < item.length; i++) begin
+            wait (vif.arvalid == 1);
+            random_delay();
+            vif.arready <= 1;
+            @(posedge vif.clk);
+            vif.arready <= 0;
+
+            wait (vif.rready == 1);
+            random_delay();
+            vif.rdata  <= item.base_data + i;
+            vif.rvalid <= 1;
+            @(posedge vif.clk);
+            vif.rvalid <= 0;
+
+            wait (vif.awvalid == 1 && vif.wvalid == 1);
+            random_delay();
+            vif.awready <= 1;
+            vif.wready  <= 1;
+            @(posedge vif.clk);
+            vif.awready <= 0;
+            vif.wready  <= 0;
+
+            wait (vif.bready == 1);
+            random_delay();
+            vif.bvalid <= 1;
+            @(posedge vif.clk);
+            vif.bvalid <= 0;
+        end
+
+        wait (vif.dma_done == 1);
+        `uvm_info("DRV", "DMA transfer completed", UVM_MEDIUM)
+    endtask
+
+endclass
+
+`endif
+
+`ifndef DMA_MONITOR_SV
+`define DMA_MONITOR_SV
+
+class dma_monitor extends uvm_component;
+
+    `uvm_component_utils(dma_monitor)
+
+    virtual dma_if vif;
+    uvm_analysis_port #(dma_seq_item) ap;
+
+    function new(string name = "dma_monitor", uvm_component parent);
+        super.new(name, parent);
+        ap = new("ap", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        if (!uvm_config_db#(virtual dma_if)::get(this, "", "vif", vif))
+            `uvm_fatal("MON", "Failed to get virtual interface")
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        dma_seq_item item;
+
+        forever begin
+            @(posedge vif.clk);
+
+            if (vif.wvalid && vif.wready) begin
+                item = dma_seq_item::type_id::create("item");
+                item.base_data = vif.wdata;
+                item.length    = 1;
+                ap.write(item);
+
+                `uvm_info("MON", $sformatf("Observed write data: %h", vif.wdata), UVM_MEDIUM)
+            end
+        end
+    endtask
+
+endclass
+
+`endif
+      
+      `ifndef DMA_SCOREBOARD_SV
+`define DMA_SCOREBOARD_SV
+
+class dma_scoreboard extends uvm_component;
+
+    `uvm_component_utils(dma_scoreboard)
+
+    uvm_analysis_imp #(dma_seq_item, dma_scoreboard) analysis_export;
+
+    bit [31:0] expected_data[$];
+    int pass_count;
+    int fail_count;
+
+    function new(string name = "dma_scoreboard", uvm_component parent);
+        super.new(name, parent);
+        analysis_export = new("analysis_export", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        expected_data.push_back(32'hCAFEBABE);
+        expected_data.push_back(32'hCAFEBABF);
+        expected_data.push_back(32'hCAFEBAC0);
+        expected_data.push_back(32'hCAFEBAC1);
+
+        pass_count = 0;
+        fail_count = 0;
+    endfunction
+
+    function void write(dma_seq_item item);
+        bit [31:0] expected;
+
+        if (expected_data.size() == 0) begin
+            `uvm_error("SCB", $sformatf("Unexpected data received: %h", item.base_data))
+            fail_count++;
+            return;
+        end
+
+        expected = expected_data.pop_front();
+
+        if (item.base_data == expected) begin
+            pass_count++;
+            `uvm_info("SCB", $sformatf("PASS: expected=%h actual=%h", expected, item.base_data), UVM_LOW)
+        end
+        else begin
+            fail_count++;
+            `uvm_error("SCB", $sformatf("FAIL: expected=%h actual=%h", expected, item.base_data))
+        end
+    endfunction
+
+    function void report_phase(uvm_phase phase);
+        `uvm_info("SCB", $sformatf("Scoreboard result: PASS=%0d FAIL=%0d", pass_count, fail_count), UVM_NONE)
+
+        if (fail_count == 0 && pass_count == 4)
+            `uvm_info("SCB", "DMA UVM TEST PASSED", UVM_NONE)
+        else
+            `uvm_error("SCB", "DMA UVM TEST FAILED")
+    endfunction
+
+endclass
+
+`endif
+          
+          `ifndef DMA_AGENT_SV
+`define DMA_AGENT_SV
+
+class dma_agent extends uvm_agent;
+
+    `uvm_component_utils(dma_agent)
+
+    dma_driver    driver;
+    dma_monitor   monitor;
+    uvm_sequencer #(dma_seq_item) sequencer;
+
+    function new(string name = "dma_agent", uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        driver    = dma_driver::type_id::create("driver", this);
+        monitor   = dma_monitor::type_id::create("monitor", this);
+        sequencer = uvm_sequencer #(dma_seq_item)::type_id::create("sequencer", this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+        driver.seq_item_port.connect(sequencer.seq_item_export);
+    endfunction
+
+endclass
+
+`endif
+      
+      `ifndef DMA_ENV_SV
+`define DMA_ENV_SV
+
+class dma_env extends uvm_env;
+
+    `uvm_component_utils(dma_env)
+
+    dma_agent      agent;
+    dma_scoreboard scoreboard;
+
+    function new(string name = "dma_env", uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        agent      = dma_agent::type_id::create("agent", this);
+        scoreboard = dma_scoreboard::type_id::create("scoreboard", this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+        agent.monitor.ap.connect(scoreboard.analysis_export);
+    endfunction
+
+endclass
+
+`endif
+      
+      `ifndef DMA_TEST_SV
+`define DMA_TEST_SV
+
+class dma_test extends uvm_test;
+
+    `uvm_component_utils(dma_test)
+
+    dma_env      env;
+    dma_sequence seq;
+
+    function new(string name = "dma_test", uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        env = dma_env::type_id::create("env", this);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        phase.raise_objection(this);
+
+        seq = dma_sequence::type_id::create("seq");
+        seq.start(env.agent.sequencer);
+
+        #100;
+        phase.drop_objection(this);
+    endtask
+
+endclass
+
+`endif
+      
+
+
+
+module dma_tb_top;
+
+    logic clk;
+    always #5 clk = ~clk;
+
+    dma_if dma_vif(clk);
+
+    dma_top dut (
+        .clk(clk),
+        .rst_n(dma_vif.rst_n),
+        .start(dma_vif.start),
+        .length(dma_vif.length),
+
+        .busy(dma_vif.busy),
+        .dma_done(dma_vif.dma_done),
+
+        .araddr(dma_vif.araddr),
+        .arvalid(dma_vif.arvalid),
+        .arready(dma_vif.arready),
+
+        .rdata(dma_vif.rdata),
+        .rvalid(dma_vif.rvalid),
+        .rready(dma_vif.rready),
+
+        .awaddr(dma_vif.awaddr),
+        .awvalid(dma_vif.awvalid),
+        .awready(dma_vif.awready),
+
+        .wdata(dma_vif.wdata),
+        .wvalid(dma_vif.wvalid),
+        .wready(dma_vif.wready),
+
+        .bvalid(dma_vif.bvalid),
+        .bready(dma_vif.bready)
+    );
+
+    initial begin
+        clk = 0;
+        uvm_config_db#(virtual dma_if)::set(null, "*", "vif", dma_vif);
+        run_test("dma_test");
+    end
+
+    initial begin
+        $dumpfile("dma_uvm.vcd");
+        $dumpvars(0, dma_tb_top);
+    end
+
+endmodule
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
