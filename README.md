@@ -1,2 +1,1 @@
-# UVM-Verification-Environment-for-DMA
-axi-dma-uvm-verification
+# UVM Verification Environment for AXI DMA Controller
