@@ -25,4 +25,4 @@ interface dma_if(input logic clk);
     logic        bvalid;
     logic        bready;
 
-endinterface
+end interface
